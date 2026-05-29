@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+
+# IDE — IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# IDE — Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# IDE — VS Code (local only; remove if you share launch configs)
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test server / debug runs
+run/
+test-server/
+logs/
+*.log
+
+# Optional compile-only deps (not on public Maven); add jars locally
+libs/*.jar
+
+# JVM crash dumps
+hs_err_pid*
+replay_pid*

@@ -38,11 +38,15 @@ import java.util.*;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public class Utils {
+
+    private static final AtomicBoolean UNLOCK_COUNT_IN_PROGRESS = new AtomicBoolean(false);
 
     private static final int VERSION = getVersion();
     private static final boolean SUPPORTS_RGB = VERSION >= 16 || VERSION == -1;
@@ -888,88 +892,107 @@ public class Utils {
     }
 
     public static void calculateUnlockedTagCounts() {
-        runAsync(() -> {
-            LuckPerms luckPerms = LuckPermsProvider.get();
-            UserManager userManager = luckPerms.getUserManager();
-            Map<String, Integer> result = new ConcurrentHashMap<>();
+        if (!UNLOCK_COUNT_IN_PROGRESS.compareAndSet(false, true)) {
+            return;
+        }
 
-            List<Tag> tagsSnapshot = new ArrayList<>(SupremeTags.getInstance().getTagManager().getTags().values());
-            List<Variant> variantsSnapshot = new ArrayList<>(SupremeTags.getInstance().getTagManager().getVariants());
+        try {
+            runAsync(() -> {
+                try {
+                    LuckPerms luckPerms = LuckPermsProvider.get();
+                    UserManager userManager = luckPerms.getUserManager();
+                    Map<String, Integer> result = new ConcurrentHashMap<>();
 
-            OfflinePlayer[] offlinePlayers = Bukkit.getOfflinePlayers();
-            Map<UUID, User> userCache = new ConcurrentHashMap<>();
+                    List<Tag> tagsSnapshot = new ArrayList<>(SupremeTags.getInstance().getTagManager().getTags().values());
+                    List<Variant> variantsSnapshot = new ArrayList<>(SupremeTags.getInstance().getTagManager().getVariants());
 
-            // Batch size: adjust if needed
-            final int batchSize = 200;
+                    OfflinePlayer[] offlinePlayers = Bukkit.getOfflinePlayers();
+                    Map<UUID, User> userCache = new ConcurrentHashMap<>();
 
-            // Split offline players into batches
-            List<List<OfflinePlayer>> batches = new ArrayList<>();
-            for (int i = 0; i < offlinePlayers.length; i += batchSize) {
-                batches.add(Arrays.asList(Arrays.copyOfRange(
-                        offlinePlayers,
-                        i,
-                        Math.min(i + batchSize, offlinePlayers.length)
-                )));
-            }
+                    // Batch size: adjust if needed
+                    final int batchSize = 200;
 
-            // Process batches sequentially
-            CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+                    // Split offline players into batches
+                    List<List<OfflinePlayer>> batches = new ArrayList<>();
+                    for (int i = 0; i < offlinePlayers.length; i += batchSize) {
+                        batches.add(Arrays.asList(Arrays.copyOfRange(
+                                offlinePlayers,
+                                i,
+                                Math.min(i + batchSize, offlinePlayers.length)
+                        )));
+                    }
 
-            for (List<OfflinePlayer> batch : batches) {
-                chain = chain.thenCompose(v ->
-                        CompletableFuture.allOf(
-                                batch.stream()
-                                        .map(player ->
-                                                userManager.loadUser(player.getUniqueId())
-                                                        .thenAccept(user -> {
-                                                            if (user != null) {
-                                                                userCache.put(player.getUniqueId(), user);
-                                                            }
-                                                        })
-                                                        .exceptionally(ex -> null) // skip errors silently
-                                        )
-                                        .toArray(CompletableFuture[]::new)
-                        )
-                );
-            }
+                    // Process batches sequentially
+                    CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
 
-            // After all batches are done
-            chain.thenRun(() -> {
-                // Process tags
-                for (Tag tag : tagsSnapshot) {
-                    long unlocked = userCache.values().stream()
-                            .filter(user -> user.getCachedData().getPermissionData().checkPermission(tag.getPermission()) == Tristate.TRUE)
-                            .count();
-                    result.put(tag.getIdentifier(), (int) unlocked);
+                    for (List<OfflinePlayer> batch : batches) {
+                        chain = chain.thenCompose(v ->
+                                CompletableFuture.allOf(
+                                        batch.stream()
+                                                .map(player ->
+                                                        userManager.loadUser(player.getUniqueId())
+                                                                .thenAccept(user -> {
+                                                                    if (user != null) {
+                                                                        userCache.put(player.getUniqueId(), user);
+                                                                    }
+                                                                })
+                                                                .exceptionally(ex -> null) // skip errors silently
+                                                )
+                                                .toArray(CompletableFuture[]::new)
+                                )
+                        );
+                    }
+
+                    // After all batches are done
+                    chain.thenRun(() -> {
+                        // Process tags
+                        for (Tag tag : tagsSnapshot) {
+                            long unlocked = userCache.values().stream()
+                                    .filter(user -> user.getCachedData().getPermissionData().checkPermission(tag.getPermission()) == Tristate.TRUE)
+                                    .count();
+                            result.put(tag.getIdentifier(), (int) unlocked);
+                        }
+
+                        // Process variants
+                        for (Variant var : variantsSnapshot) {
+                            long unlocked = userCache.values().stream()
+                                    .filter(user -> user.getCachedData().getPermissionData().checkPermission(var.getPermission()) == Tristate.TRUE)
+                                    .count();
+                            result.put(var.getIdentifier(), (int) unlocked);
+                        }
+
+                        // Push result back to main thread
+                        runMain(() -> {
+                            TagManager.tagUnlockCounts.clear();
+                            TagManager.tagUnlockCounts.putAll(result);
+                            UNLOCK_COUNT_IN_PROGRESS.set(false);
+                        });
+                    }).exceptionally(ex -> {
+                        UNLOCK_COUNT_IN_PROGRESS.set(false);
+                        return null;
+                    });
+                } catch (Exception ex) {
+                    UNLOCK_COUNT_IN_PROGRESS.set(false);
                 }
-
-                // Process variants
-                for (Variant var : variantsSnapshot) {
-                    long unlocked = userCache.values().stream()
-                            .filter(user -> user.getCachedData().getPermissionData().checkPermission(var.getPermission()) == Tristate.TRUE)
-                            .count();
-                    result.put(var.getIdentifier(), (int) unlocked);
-                }
-
-                // Push result back to main thread
-                runMain(() -> {
-                    TagManager.tagUnlockCounts.clear();
-                    TagManager.tagUnlockCounts.putAll(result);
-                });
             });
-        });
+        } catch (Exception ex) {
+            UNLOCK_COUNT_IN_PROGRESS.set(false);
+        }
     }
 
     public static void scheduleUnlockCount() {
         long intervalTicks = 20L * SupremeTags.getInstance().getConfig().getInt("settings.update-unlocked-cache");
         long initialDelay = Math.max(1L, intervalTicks); // Ensure at least 1 tick delay
+        long intervalSeconds = SupremeTags.getInstance().getConfig().getInt("settings.update-unlocked-cache");
+        long initialDelaySeconds = Math.max(1L, intervalSeconds);
 
         if (SupremeTags.getInstance().isFoliaFound()) {
-            Bukkit.getServer().getGlobalRegionScheduler().runAtFixedRate(
+            Bukkit.getAsyncScheduler().runAtFixedRate(
                     SupremeTags.getInstance(),
                     task -> calculateUnlockedTagCounts(),
-                    initialDelay,
-                    intervalTicks
+                    initialDelaySeconds,
+                    intervalSeconds,
+                    TimeUnit.SECONDS
             );
         } else {
             Bukkit.getScheduler().runTaskTimer(
@@ -983,7 +1006,7 @@ public class Utils {
 
     public static void runAsync(Runnable task) {
         if (SupremeTags.getInstance().isFoliaFound()) {
-            Bukkit.getServer().getGlobalRegionScheduler().run(SupremeTags.getInstance(), (s) -> task.run());
+            Bukkit.getAsyncScheduler().runNow(SupremeTags.getInstance(), scheduledTask -> task.run());
         } else {
             Bukkit.getScheduler().runTaskAsynchronously(SupremeTags.getInstance(), task);
         }
